@@ -1,23 +1,54 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
-import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { tmpdir, userInfo } from "node:os";
+import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
+  __resetAuthEncryptionKeyCacheForTests,
   clearAllCredentials,
   formatOAuthCredentialStoreUnavailable,
   getAuthEntry,
+  getAuthEntryEncFilePath,
   getAuthEntryFilePath,
+  getAuthForUrl,
   getAuthStorageOptions,
   inspectAuthForUrl,
   OAuthCredentialStoreError,
   saveAuthEntry,
 } from "../mcp-auth.ts";
 
-function createRecoveryHarness(): { harnessDir: string; storePath: string } {
+const DEK_ACCOUNT = "encryption-key.v1";
+
+function accountFor(serverName: string): string {
+  return `sha256-${createHash("sha256").update(serverName, "utf8").digest("hex")}`;
+}
+
+/** Seed a legacy keyring entry (single item, or manifest + chunks) in the fake store. */
+function seedLegacyKeyringEntry(storePath: string, serverName: string, entry: unknown, chunkSize = 1800): void {
+  const store = existsSync(storePath) ? JSON.parse(readFileSync(storePath, "utf8")) as Record<string, string> : {};
+  const account = accountFor(serverName);
+  const payload = JSON.stringify(entry);
+  if (payload.length <= chunkSize) {
+    store[account] = payload;
+  } else {
+    const chunkCount = Math.ceil(payload.length / chunkSize);
+    const chunkDigest = createHash("sha256").update(payload, "utf8").digest("hex").slice(0, 16);
+    for (let index = 0; index < chunkCount; index++) {
+      store[`${account}.chunk.${chunkDigest}.${index}`] = payload.slice(index * chunkSize, (index + 1) * chunkSize);
+    }
+    store[account] = JSON.stringify({ __piMcpAdapterOAuthChunked: 1, chunkCount, chunkDigest });
+  }
+  writeFileSync(storePath, JSON.stringify(store));
+}
+
+function createRecoveryHarness(): { harnessDir: string; storePath: string; logPath: string } {
   const harnessDir = mkdtempSync(join(tmpdir(), "pi-mcp-keyring-recovery-"));
   const keyctlPath = join(harnessDir, "keyctl");
   const helperPath = join(harnessDir, "helper.cjs");
   const storePath = join(harnessDir, "store.json");
+  const logPath = join(harnessDir, "ops.log");
 
   writeFileSync(keyctlPath, `#!/usr/bin/env bash
 set -euo pipefail
@@ -25,26 +56,39 @@ if [ "$1" != "session" ] || [ "$2" != "-" ]; then exit 64; fi
 shift 2
 exec "$@"
 `, { mode: 0o755 });
-  writeFileSync(helperPath, `const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+  writeFileSync(helperPath, `const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs');
 const input = JSON.parse(readFileSync(0, 'utf8'));
+appendFileSync(process.env.PI_MCP_ADAPTER_FAKE_KEYRING_LOG, input.operation + ' ' + input.account + '\\n');
 const path = process.env.PI_MCP_ADAPTER_FAKE_KEYRING_STORE;
 const store = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+// Atomic write so concurrent helper processes never observe a torn store file.
+const persist = () => {
+  const tmp = path + '.' + process.pid + '.tmp';
+  writeFileSync(tmp, JSON.stringify(store));
+  require('node:fs').renameSync(tmp, path);
+};
 if (input.operation === 'read') {
   const value = store[input.account];
   process.stdout.write(JSON.stringify(value === undefined ? { ok: true, found: false } : { ok: true, found: true, value }) + '\\n');
 } else if (input.operation === 'write') {
   store[input.account] = input.payload;
-  writeFileSync(path, JSON.stringify(store));
+  persist();
   process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
 } else if (input.operation === 'remove') {
-  delete store[input.account];
-  writeFileSync(path, JSON.stringify(store));
-  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+  if (process.env.PI_MCP_ADAPTER_FAKE_KEYRING_DENY_REMOVE === '1') {
+    process.stdout.write(JSON.stringify({ ok: false, error: 'denied' }) + '\\n');
+    process.exitCode = 1;
+  } else {
+    delete store[input.account];
+    persist();
+    process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+  }
 } else {
   process.stdout.write(JSON.stringify({ ok: false, error: 'bad op' }) + '\\n');
   process.exitCode = 1;
 }
 `);
+  writeFileSync(logPath, "");
 
   process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "keyrevoked";
   process.env.PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOVERY = "1";
@@ -52,11 +96,14 @@ if (input.operation === 'read') {
   process.env.PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE = process.execPath;
   process.env.PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER = helperPath;
   process.env.PI_MCP_ADAPTER_FAKE_KEYRING_STORE = storePath;
-  return { harnessDir, storePath };
+  process.env.PI_MCP_ADAPTER_FAKE_KEYRING_LOG = logPath;
+  return { harnessDir, storePath, logPath };
 }
 
 function readRecoveryStore(storePath: string): Record<string, string> {
-  return JSON.parse(readFileSync(storePath, "utf8")) as Record<string, string>;
+  return existsSync(storePath)
+    ? JSON.parse(readFileSync(storePath, "utf8")) as Record<string, string>
+    : {};
 }
 
 describe("OAuth credential-store diagnostics", () => {
@@ -74,6 +121,17 @@ describe("OAuth credential-store diagnostics", () => {
       expect(message).toContain("OAuth credential store unavailable");
     }
   });
+
+  it("explains the macOS keychain prompt when the store is unavailable", () => {
+    const error = new OAuthCredentialStoreError("read failed", "read", new Error("simulated"));
+    const message = formatOAuthCredentialStoreUnavailable(error);
+    if (process.platform === "darwin") {
+      expect(message).toContain("macOS is asking for your login keychain password (normally your Mac login password)");
+      expect(message).toContain("Always Allow");
+    } else {
+      expect(message).toContain("OAuth credential store unavailable");
+    }
+  });
 });
 
 describe("mcp-auth storage paths", () => {
@@ -85,12 +143,14 @@ describe("mcp-auth storage paths", () => {
     PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE: process.env.PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE,
     PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER: process.env.PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER,
     PI_MCP_ADAPTER_FAKE_KEYRING_STORE: process.env.PI_MCP_ADAPTER_FAKE_KEYRING_STORE,
+    PI_MCP_ADAPTER_FAKE_KEYRING_LOG: process.env.PI_MCP_ADAPTER_FAKE_KEYRING_LOG,
   };
   let authDir: string;
 
   beforeEach(() => {
     authDir = mkdtempSync(join(tmpdir(), "pi-mcp-auth-storage-"));
     process.env.MCP_OAUTH_DIR = authDir;
+    __resetAuthEncryptionKeyCacheForTests();
   });
 
   afterEach(() => {
@@ -101,10 +161,11 @@ describe("mcp-auth storage paths", () => {
         process.env[key] = value;
       }
     }
+    __resetAuthEncryptionKeyCacheForTests();
     rmSync(authDir, { recursive: true, force: true });
   });
 
-  it("keeps arbitrary configured server names under safe hashed legacy import paths", () => {
+  it("keeps arbitrary configured server names under safe hashed storage paths", () => {
     const names = ["Cloudflare Workers", "сервер", "../escape", "@scope/name", ""];
 
     for (const [index, name] of names.entries()) {
@@ -118,6 +179,13 @@ describe("mcp-auth storage paths", () => {
       expect(isAbsolute(rel)).toBe(false);
       expect(rel).toMatch(/^sha256-[a-f0-9]{64}\/tokens\.json$/);
       expect(existsSync(filePath)).toBe(false);
+
+      const encPath = getAuthEntryEncFilePath(name);
+      const encRel = relative(authDir, encPath);
+      expect(encRel.startsWith("..")).toBe(false);
+      expect(isAbsolute(encRel)).toBe(false);
+      expect(encRel).toMatch(/^sha256-[a-f0-9]{64}\.enc$/);
+      expect(existsSync(encPath)).toBe(true);
     }
 
     expect(existsSync(join(authDir, "..", "escape", "tokens.json"))).toBe(false);
@@ -125,9 +193,160 @@ describe("mcp-auth storage paths", () => {
 
   it("rejects non-string names at the storage boundary", () => {
     expect(() => getAuthEntryFilePath(undefined as unknown as string)).toThrow(/Invalid MCP server name/);
+    expect(() => getAuthEntryEncFilePath(undefined as unknown as string)).toThrow(/Invalid MCP server name/);
   });
 
-  it("uses configured oauthDir as the legacy import source", () => {
+  it("stores entries as AES-256-GCM encrypted files, never plaintext", () => {
+    saveAuthEntry("encrypted", { tokens: { accessToken: "super-secret-token" } }, "https://example.com/mcp");
+
+    const encPath = getAuthEntryEncFilePath("encrypted");
+    expect(existsSync(encPath)).toBe(true);
+    expect(existsSync(getAuthEntryFilePath("encrypted"))).toBe(false);
+
+    const raw = readFileSync(encPath, "utf8");
+    expect(raw).not.toContain("super-secret-token");
+    const envelope = JSON.parse(raw) as { v?: number; iv?: string; tag?: string; data?: string };
+    expect(envelope.v).toBe(1);
+    expect(Buffer.from(envelope.iv!, "base64")).toHaveLength(12);
+    expect(Buffer.from(envelope.tag!, "base64")).toHaveLength(16);
+    expect(envelope.data).toBeTruthy();
+
+    // Owner-only permissions (umask can only restrict further).
+    expect(statSync(encPath).mode & 0o077).toBe(0);
+
+    expect(getAuthEntry("encrypted")?.tokens?.accessToken).toBe("super-secret-token");
+  });
+
+  it("keeps the serverUrl binding through encrypted storage", () => {
+    saveAuthEntry("url-bound", { tokens: { accessToken: "token" } }, "https://api.example.com/mcp");
+
+    expect(getAuthForUrl("url-bound", "https://different.example.com/mcp")).toBeUndefined();
+    expect(getAuthForUrl("url-bound", "https://api.example.com/mcp")?.tokens?.accessToken).toBe("token");
+
+    // URL change invalidates even after re-reading the encrypted file.
+    __resetAuthEncryptionKeyCacheForTests();
+    expect(getAuthForUrl("url-bound", "https://api.example.com/mcp/v2")).toBeUndefined();
+  });
+
+  it("treats corrupt encrypted files as unauthenticated without crashing", () => {
+    saveAuthEntry("corrupt-file", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    const encPath = getAuthEntryEncFilePath("corrupt-file");
+
+    writeFileSync(encPath, "not json at all");
+    expect(getAuthEntry("corrupt-file")).toBeUndefined();
+    expect(inspectAuthForUrl("corrupt-file", "https://example.com/mcp").status).toBe("absent");
+
+    // Valid envelope, tampered ciphertext: GCM verification must reject it.
+    saveAuthEntry("corrupt-file", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    const envelope = JSON.parse(readFileSync(encPath, "utf8")) as { data: string, tag: string };
+    // Deterministic toggle (a fixed replacement is a no-op 1/64 of the time).
+    envelope.data = `${envelope.data.startsWith("A") ? "B" : "A"}${envelope.data.slice(1)}`;
+    writeFileSync(encPath, JSON.stringify(envelope));
+    expect(getAuthEntry("corrupt-file")).toBeUndefined();
+
+    // Truncated GCM tag: Node accepts 4-byte tags unless authTagLength is set.
+    saveAuthEntry("corrupt-file", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    const truncated = JSON.parse(readFileSync(encPath, "utf8")) as { tag: string };
+    truncated.tag = Buffer.from(truncated.tag, "base64").subarray(0, 4).toString("base64");
+    writeFileSync(encPath, JSON.stringify(truncated));
+    expect(getAuthEntry("corrupt-file")).toBeUndefined();
+  });
+
+  it("never reuses a pre-placed staging file at the predictable temp name", () => {
+    // The pre-fix staging path was <file>.<pid>.tmp opened without O_EXCL:
+    // a planted world-writable file kept its 0666 mode into the final .enc.
+    const encPath = getAuthEntryEncFilePath("staging-mode");
+    const predictableTmp = `${encPath}.${process.pid}.tmp`;
+    writeFileSync(predictableTmp, "planted", { mode: 0o666 });
+    chmodSync(predictableTmp, 0o666);
+
+    saveAuthEntry("staging-mode", { tokens: { accessToken: "token" } });
+
+    expect(statSync(encPath).mode & 0o077).toBe(0);
+    expect(getAuthEntry("staging-mode")?.tokens?.accessToken).toBe("token");
+    // The planted file is untouched: staging uses an unpredictable O_EXCL name.
+    expect(readFileSync(predictableTmp, "utf8")).toBe("planted");
+    rmSync(predictableTmp, { force: true });
+  });
+
+  it("never follows a pre-placed staging symlink at the predictable temp name", () => {
+    const encPath = getAuthEntryEncFilePath("staging-link");
+    const victim = join(authDir, "staging-victim.txt");
+    writeFileSync(victim, "do not touch");
+    const predictableTmp = `${encPath}.${process.pid}.tmp`;
+    symlinkSync(victim, predictableTmp);
+
+    saveAuthEntry("staging-link", { tokens: { accessToken: "token" } });
+
+    expect(readFileSync(victim, "utf8")).toBe("do not touch");
+    expect(lstatSync(predictableTmp).isSymbolicLink()).toBe(true);
+    expect(getAuthEntry("staging-link")?.tokens?.accessToken).toBe("token");
+    rmSync(predictableTmp, { force: true });
+  });
+
+  it("never follows or reuses a pre-placed symlink at the credential path", () => {
+    const encPath = getAuthEntryEncFilePath("symlink-target");
+    const victim = join(authDir, "victim.txt");
+    writeFileSync(victim, "do not touch");
+    symlinkSync(victim, encPath);
+
+    saveAuthEntry("symlink-target", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+
+    expect(readFileSync(victim, "utf8")).toBe("do not touch");
+    expect(lstatSync(encPath).isSymbolicLink()).toBe(false);
+    expect(getAuthEntry("symlink-target")?.tokens?.accessToken).toBe("token");
+  });
+
+  it("enforces owner-only permissions even when overwriting a world-writable file", () => {
+    const encPath = getAuthEntryEncFilePath("loose-file");
+    mkdirSync(dirname(encPath), { recursive: true });
+    writeFileSync(encPath, "old", { mode: 0o666 });
+    chmodSync(encPath, 0o666);
+
+    saveAuthEntry("loose-file", { tokens: { accessToken: "token" } });
+
+    expect(statSync(encPath).mode & 0o077).toBe(0);
+    expect(getAuthEntry("loose-file")?.tokens?.accessToken).toBe("token");
+  });
+
+  it("never fails status inspection when legacy plaintext cleanup fails", () => {
+    saveAuthEntry("sticky-legacy", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    const legacyPath = getAuthEntryFilePath("sticky-legacy");
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({ tokens: { accessToken: "legacy" } }));
+    // Make the legacy file undeletable; cleanup must degrade to a later retry,
+    // not throw a raw error through inspectAuthForUrl.
+    chmodSync(dirname(legacyPath), 0o555);
+    try {
+      expect(inspectAuthForUrl("sticky-legacy", "https://example.com/mcp").status).toBe("present");
+      expect(getAuthEntry("sticky-legacy")?.tokens?.accessToken).toBe("token");
+      // Proves the cleanup genuinely failed (not a no-op on this runner).
+      expect(existsSync(legacyPath)).toBe(true);
+    } finally {
+      chmodSync(dirname(legacyPath), 0o755);
+    }
+  });
+
+  it("fails closed when the OS credential store is unavailable, even with an encrypted file present", () => {
+    saveAuthEntry("store-down", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    expect(existsSync(getAuthEntryEncFilePath("store-down"))).toBe(true);
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "unavailable";
+    try {
+      expect(() => getAuthEntry("store-down")).toThrow(OAuthCredentialStoreError);
+      expect(() => getAuthEntry("store-down")).toThrow(/OS secure credential store/);
+      const status = inspectAuthForUrl("store-down", "https://example.com/mcp");
+      expect(status.status).toBe("unavailable");
+      if (process.platform === "darwin") {
+        expect(() => getAuthEntry("store-down")).toThrow(/Always Allow/);
+        if (status.status === "unavailable") expect(status.message).toContain("Always Allow");
+      }
+    } finally {
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    }
+  });
+
+  it("uses configured oauthDir as the legacy import source and encrypted-file target", () => {
     delete process.env.MCP_OAUTH_DIR;
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-auth-project-"));
     const options = getAuthStorageOptions(".pi/oauth", project);
@@ -138,11 +357,44 @@ describe("mcp-auth storage paths", () => {
     expect(getAuthEntry("configured", options)?.tokens?.accessToken).toBe("legacy-token");
     expect(filePath.startsWith(join(project, ".pi", "oauth"))).toBe(true);
     expect(existsSync(filePath)).toBe(false);
+    // The migrated entry now lives as an encrypted file in the configured dir.
+    const encPath = getAuthEntryEncFilePath("configured", options);
+    expect(encPath.startsWith(join(project, ".pi", "oauth"))).toBe(true);
+    expect(existsSync(encPath)).toBe(true);
     expect(getAuthEntry("configured", options)?.tokens?.accessToken).toBe("legacy-token");
     rmSync(project, { recursive: true, force: true });
   });
 
-  it("does not migrate legacy credentials during status-only inspection", () => {
+  it("fails closed on write: an unavailable store means no file is ever written", () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "unavailable";
+    try {
+      expect(() => saveAuthEntry("write-fail-closed", { tokens: { accessToken: "token" } }, "https://example.com/mcp"))
+        .toThrow(OAuthCredentialStoreError);
+      expect(existsSync(getAuthEntryEncFilePath("write-fail-closed"))).toBe(false);
+      // No plaintext or torn tmp files either.
+      expect(readdirSync(authDir).filter(name => name.includes("write-fail-closed") || name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    }
+  });
+
+  it("deletes the encrypted file even when the keyring is unavailable during logout", () => {
+    saveAuthEntry("logout-store-down", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+    const encPath = getAuthEntryEncFilePath("logout-store-down");
+    expect(existsSync(encPath)).toBe(true);
+
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "unavailable";
+    try {
+      // Legacy keyring cleanup still fails loudly (leftover items could be
+      // re-imported), but the canonical credential file is already gone.
+      expect(() => clearAllCredentials("logout-store-down")).toThrow(OAuthCredentialStoreError);
+      expect(existsSync(encPath)).toBe(false);
+    } finally {
+      process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    }
+  });
+
+  it("migrates legacy credentials during status-only inspection so prompts cannot repeat", () => {
     const filePath = getAuthEntryFilePath("status-only");
     mkdirSync(dirname(filePath), { recursive: true });
     writeFileSync(filePath, JSON.stringify({
@@ -151,13 +403,15 @@ describe("mcp-auth storage paths", () => {
     }), "utf-8");
 
     expect(inspectAuthForUrl("status-only", "https://example.com/mcp").status).toBe("present");
-    expect(existsSync(filePath)).toBe(true);
+    // Status inspection migrates like any other read: re-reading legacy
+    // keychain items on every panel refresh would re-trigger the prompt storm.
+    expect(existsSync(filePath)).toBe(false);
+    expect(existsSync(getAuthEntryEncFilePath("status-only"))).toBe(true);
 
     expect(getAuthEntry("status-only")?.tokens?.accessToken).toBe("legacy-token");
-    expect(existsSync(filePath)).toBe(false);
   });
 
-  it("does not use configured oauthDir values as secure-store namespaces", () => {
+  it("scopes encrypted credentials to the configured oauthDir", () => {
     delete process.env.MCP_OAUTH_DIR;
     const projectA = mkdtempSync(join(tmpdir(), "pi-mcp-auth-project-a-"));
     const projectB = mkdtempSync(join(tmpdir(), "pi-mcp-auth-project-b-"));
@@ -167,7 +421,7 @@ describe("mcp-auth storage paths", () => {
     saveAuthEntry("same-server", { tokens: { accessToken: "token-a" } }, "https://example.com/mcp", optionsA);
     saveAuthEntry("same-server", { tokens: { accessToken: "token-b" } }, "https://example.com/mcp", optionsB);
 
-    expect(getAuthEntry("same-server", optionsA)?.tokens?.accessToken).toBe("token-b");
+    expect(getAuthEntry("same-server", optionsA)?.tokens?.accessToken).toBe("token-a");
     expect(getAuthEntry("same-server", optionsB)?.tokens?.accessToken).toBe("token-b");
     rmSync(projectA, { recursive: true, force: true });
     rmSync(projectB, { recursive: true, force: true });
@@ -179,79 +433,511 @@ describe("mcp-auth storage paths", () => {
 
     saveAuthEntry("env-override", { tokens: { accessToken: "token" } }, "https://example.com/mcp", options);
 
-    const filePath = getAuthEntryFilePath("env-override", options);
+    const filePath = getAuthEntryEncFilePath("env-override", options);
     expect(filePath.startsWith(authDir)).toBe(true);
     expect(filePath.startsWith(join(project, ".pi", "oauth"))).toBe(false);
     rmSync(project, { recursive: true, force: true });
   });
 
-  it("round-trips large secure-store entries", () => {
+  it("round-trips large entries as a single encrypted file", () => {
     const accessToken = "x".repeat(5000);
     saveAuthEntry("large-entry", { tokens: { accessToken } }, "https://example.com/mcp");
     expect(getAuthEntry("large-entry")?.tokens?.accessToken).toBe(accessToken);
+    expect(readFileSync(getAuthEntryEncFilePath("large-entry"), "utf8")).not.toContain(accessToken);
   });
 
   describe("Linux keyring recovery helper", () => {
     let harnessDir: string;
     let storePath: string;
+    let logPath: string;
 
     beforeEach(() => {
-      ({ harnessDir, storePath } = createRecoveryHarness());
+      ({ harnessDir, storePath, logPath } = createRecoveryHarness());
     });
 
     afterEach(() => {
       rmSync(harnessDir, { recursive: true, force: true });
     });
 
-    it("routes revoked keyring operations through the helper", () => {
+    it("routes revoked keyring operations through the helper and stores only the encryption key there", () => {
       saveAuthEntry("recovered", { tokens: { accessToken: "token" } });
       expect(getAuthEntry("recovered")?.tokens?.accessToken).toBe("token");
+
+      // Exactly one keyring item total: the shared encryption key. No
+      // per-server items, no chunks — that is what ends the prompt storm.
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+
       clearAllCredentials("recovered");
-      expect(readRecoveryStore(storePath)).toEqual({});
+      expect(getAuthEntry("recovered")).toBeUndefined();
+      // The DEK stays; it is shared by all servers of this install.
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
     });
 
-    it("chunks large entries within the secure-store payload limit", () => {
+    it("stores large entries without keyring chunking", () => {
       const accessToken = "x".repeat(5000);
       saveAuthEntry("large", { tokens: { accessToken } });
       expect(getAuthEntry("large")?.tokens?.accessToken).toBe(accessToken);
 
       const store = readRecoveryStore(storePath);
-      const chunkEntries = Object.entries(store).filter(([account]) => account.includes(".chunk."));
-      const manifestPayload = Object.entries(store).find(([account]) => !account.includes(".chunk."))?.[1];
-      expect(manifestPayload).toBeDefined();
-      const manifest = JSON.parse(manifestPayload!) as { __piMcpAdapterOAuthChunked?: number; chunkCount?: number };
-      expect(manifest.__piMcpAdapterOAuthChunked).toBe(1);
-      expect(chunkEntries).toHaveLength(manifest.chunkCount);
-      expect(chunkEntries.every(([, payload]) => payload.length <= 1800)).toBe(true);
+      expect(Object.keys(store)).toEqual([DEK_ACCOUNT]);
+      expect(Buffer.from(store[DEK_ACCOUNT], "base64")).toHaveLength(32);
     });
 
-    it("reports unavailable status when a chunk is missing", () => {
-      const serverUrl = "https://example.com/mcp";
-      saveAuthEntry("corrupt", { tokens: { accessToken: "x".repeat(5000) } }, serverUrl);
+    it("migrates chunked legacy keyring entries to an encrypted file and never re-reads them", () => {
+      const entry = {
+        tokens: { accessToken: "chunked-token", refreshToken: "r".repeat(3000) },
+        clientInfo: { clientId: "chunked-client" },
+        serverUrl: "https://example.com/mcp",
+      };
+      seedLegacyKeyringEntry(storePath, "migrated", entry);
+      expect(Object.keys(readRecoveryStore(storePath)).length).toBeGreaterThan(1);
+
+      expect(getAuthEntry("migrated")).toEqual(entry);
+
+      // Legacy manifest and chunks were deleted; only the DEK remains.
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+      expect(existsSync(getAuthEntryEncFilePath("migrated"))).toBe(true);
+      expect(existsSync(getAuthEntryFilePath("migrated"))).toBe(false);
+
+      // Second read comes from the encrypted file with the cached key: no
+      // further keyring access at all, so prompts cannot loop.
+      const opsBefore = readFileSync(logPath, "utf8");
+      expect(getAuthEntry("migrated")).toEqual(entry);
+      expect(readFileSync(logPath, "utf8")).toBe(opsBefore);
+    });
+
+    it("migrates single-item legacy keyring entries", () => {
+      seedLegacyKeyringEntry(storePath, "small-legacy", { tokens: { accessToken: "small-token" }, serverUrl: "https://example.com/mcp" });
+
+      expect(getAuthEntry("small-legacy")?.tokens?.accessToken).toBe("small-token");
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+      expect(getAuthEntry("small-legacy")?.tokens?.accessToken).toBe("small-token");
+    });
+
+    it("migrates legacy keyring entries during status inspection, then never touches the keyring again", () => {
+      seedLegacyKeyringEntry(storePath, "panel-server", { tokens: { accessToken: "panel-token" }, serverUrl: "https://example.com/mcp" });
+
+      expect(inspectAuthForUrl("panel-server", "https://example.com/mcp").status).toBe("present");
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+      expect(existsSync(getAuthEntryEncFilePath("panel-server"))).toBe(true);
+
+      const opsBefore = readFileSync(logPath, "utf8");
+      expect(inspectAuthForUrl("panel-server", "https://example.com/mcp").status).toBe("present");
+      expect(inspectAuthForUrl("panel-server", "https://example.com/mcp").status).toBe("present");
+      expect(readFileSync(logPath, "utf8")).toBe(opsBefore);
+    });
+
+    it("wraps recovery helper failures as credential-store errors instead of leaking raw errors", () => {
+      saveAuthEntry("helper-down", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+      expect(existsSync(getAuthEntryEncFilePath("helper-down"))).toBe(true);
+
+      // The store still reports KeyRevoked, but the helper can no longer run.
+      writeFileSync(join(harnessDir, "keyctl"), "#!/usr/bin/env bash\nexit 99\n", { mode: 0o755 });
+      __resetAuthEncryptionKeyCacheForTests();
+
+      expect(() => getAuthEntry("helper-down")).toThrow(OAuthCredentialStoreError);
+      expect(() => getAuthEntry("helper-down")).toThrow(/OS secure credential store/);
+      expect(inspectAuthForUrl("helper-down", "https://example.com/mcp").status).toBe("unavailable");
+    });
+
+    it("treats partial or corrupt legacy chunk sets as unauthenticated without crashing", () => {
+      seedLegacyKeyringEntry(storePath, "torn", { tokens: { accessToken: "t".repeat(3000) } });
       const store = readRecoveryStore(storePath);
-      const missingChunk = Object.keys(store).find((account) => account.includes(".chunk."));
-      expect(missingChunk).toBeDefined();
-      delete store[missingChunk!];
+      const chunkAccount = Object.keys(store).find(account => account.includes(".chunk."));
+      expect(chunkAccount).toBeDefined();
+      delete store[chunkAccount!];
       writeFileSync(storePath, JSON.stringify(store));
-      expect(inspectAuthForUrl("corrupt", serverUrl).status).toBe("unavailable");
+
+      expect(getAuthEntry("torn")).toBeUndefined();
+      expect(inspectAuthForUrl("torn", "https://example.com/mcp").status).toBe("absent");
+
+      // Corrupt legacy entries are retired: deleted from the keyring, so
+      // status refreshes can never prompt for them again. Later reads may still
+      // probe the (absent) main account — probing an absent item never prompts.
+      expect(readRecoveryStore(storePath)).toEqual({});
+      writeFileSync(logPath, "");
+      expect(getAuthEntry("torn")).toBeUndefined();
+      expect(inspectAuthForUrl("torn", "https://example.com/mcp").status).toBe("absent");
+      const tornOps = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+      expect(tornOps.length).toBeGreaterThan(0);
+      expect(tornOps.every(op => op === `read ${accountFor("torn")}`)).toBe(true);
+
+      // Unparseable main item: also unauthenticated, retired, never a crash.
+      writeFileSync(storePath, JSON.stringify({ [accountFor("garbage")]: "}{not json" }));
+      expect(getAuthEntry("garbage")).toBeUndefined();
+      expect(readRecoveryStore(storePath)).toEqual({});
+      writeFileSync(logPath, "");
+      expect(getAuthEntry("garbage")).toBeUndefined();
+      expect(readFileSync(logPath, "utf8")).toBe(`read ${accountFor("garbage")}\n`);
     });
 
-    it("cleans stale chunks when a large entry is replaced", () => {
+    it("retires legacy values that parse but are not credential objects", () => {
+      for (const bogus of ["null", "false", "0", "\"\"", "[]"]) {
+        writeFileSync(storePath, JSON.stringify({ [accountFor("bogus")]: bogus }));
+        expect(getAuthEntry("bogus"), `payload ${bogus}`).toBeUndefined();
+        expect(readRecoveryStore(storePath)).toEqual({});
+      }
+    });
+
+    it("skips a deletion-denied corrupt entry until a later valid write replaces it", () => {
+      process.env.PI_MCP_ADAPTER_FAKE_KEYRING_DENY_REMOVE = "1";
+      try {
+        writeFileSync(storePath, JSON.stringify({ [accountFor("denied")]: "}{corrupt" }));
+        expect(getAuthEntry("denied")).toBeUndefined();
+        expect(readRecoveryStore(storePath)).toEqual({ [accountFor("denied")]: "}{corrupt" });
+
+        // While the corrupt bytes are unchanged, later inspections do one cheap
+        // re-read (hash compare) and nothing else: no chunk fan-out, no removes.
+        writeFileSync(logPath, "");
+        expect(getAuthEntry("denied")).toBeUndefined();
+        expect(inspectAuthForUrl("denied", "https://example.com/mcp").status).toBe("absent");
+        const ops = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+        expect(ops).toEqual([`read ${accountFor("denied")}`, `read ${accountFor("denied")}`]);
+      } finally {
+        delete process.env.PI_MCP_ADAPTER_FAKE_KEYRING_DENY_REMOVE;
+      }
+
+      // A pre-v5 process later writes a valid entry over the corrupt one: the
+      // bytes differ from the cached corrupt hash, so it is seen and migrated.
+      seedLegacyKeyringEntry(storePath, "denied", { tokens: { accessToken: "late-token" }, serverUrl: "https://example.com/mcp" });
+      expect(getAuthEntry("denied")?.tokens?.accessToken).toBe("late-token");
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+    });
+
+    it("sees a legacy entry written later by a concurrently running pre-v5 process", () => {
+      // Absence is not cached: a mixed-version writer must not be hidden.
+      expect(getAuthEntry("late-legacy")).toBeUndefined();
+      seedLegacyKeyringEntry(storePath, "late-legacy", { tokens: { accessToken: "late-token" }, serverUrl: "https://example.com/mcp" });
+      expect(getAuthEntry("late-legacy")?.tokens?.accessToken).toBe("late-token");
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+    });
+
+    it("retires pathological chunk manifests without crashing", () => {
+      writeFileSync(storePath, JSON.stringify({
+        [accountFor("pathological")]: JSON.stringify({
+          __piMcpAdapterOAuthChunked: 1,
+          chunkCount: 4294967296,
+          chunkDigest: "0123456789abcdef",
+        }),
+      }));
+
+      expect(getAuthEntry("pathological")).toBeUndefined();
+      expect(readRecoveryStore(storePath)).toEqual({});
+    });
+
+    it("verifies the chunk digest and retires tampered legacy entries", () => {
+      seedLegacyKeyringEntry(storePath, "tampered-legacy", { tokens: { accessToken: "t".repeat(1000) } }, 200);
+      const store = readRecoveryStore(storePath);
+      // Modify chunk contents without touching the manifest while keeping the
+      // assembled payload valid JSON: only digest verification catches this.
+      const chunkAccounts = Object.keys(store).filter(account => account.includes(".chunk.")).sort();
+      expect(chunkAccounts.length).toBeGreaterThan(1);
+      const lastChunk = chunkAccounts[chunkAccounts.length - 1]!;
+      const tokenIndex = store[lastChunk].lastIndexOf("t");
+      expect(tokenIndex).toBeGreaterThanOrEqual(0);
+      store[lastChunk] = `${store[lastChunk].slice(0, tokenIndex)}u${store[lastChunk].slice(tokenIndex + 1)}`;
+      writeFileSync(storePath, JSON.stringify(store));
+
+      expect(getAuthEntry("tampered-legacy")).toBeUndefined();
+      expect(readRecoveryStore(storePath)).toEqual({});
+    });
+
+    it("treats encrypted files as unauthenticated when the key is gone or changed", () => {
+      saveAuthEntry("key-issues", { tokens: { accessToken: "token" } }, "https://example.com/mcp");
+
+      // Key rotated away (e.g. old keychain item lost): cannot decrypt.
+      const store = readRecoveryStore(storePath);
+      store[DEK_ACCOUNT] = randomBytes(32).toString("base64");
+      writeFileSync(storePath, JSON.stringify(store));
+      __resetAuthEncryptionKeyCacheForTests();
+      expect(getAuthEntry("key-issues")).toBeUndefined();
+      expect(inspectAuthForUrl("key-issues", "https://example.com/mcp").status).toBe("absent");
+
+      // Key deleted entirely: still no plaintext fallback, just re-authenticate.
+      writeFileSync(storePath, JSON.stringify({}));
+      __resetAuthEncryptionKeyCacheForTests();
+      expect(getAuthEntry("key-issues")).toBeUndefined();
+    });
+
+    it("overwrites large entries without leaving keyring chunks behind", () => {
       saveAuthEntry("shrinking", { tokens: { accessToken: "x".repeat(5000) } });
       saveAuthEntry("shrinking", { tokens: { accessToken: "small" } });
 
       expect(getAuthEntry("shrinking")?.tokens?.accessToken).toBe("small");
-      const accounts = Object.keys(readRecoveryStore(storePath));
-      expect(accounts).toHaveLength(1);
-      expect(accounts[0]).not.toContain(".chunk.");
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
     });
 
-    it("removes chunk payloads when credentials are cleared", () => {
-      saveAuthEntry("removing", { tokens: { accessToken: "x".repeat(5000) } });
-      expect(Object.keys(readRecoveryStore(storePath)).some((account) => account.includes(".chunk."))).toBe(true);
+    it("removes legacy chunked keyring entries when credentials are cleared", () => {
+      seedLegacyKeyringEntry(storePath, "removing", { tokens: { accessToken: "x".repeat(5000) } });
+      expect(Object.keys(readRecoveryStore(storePath)).some(account => account.includes(".chunk."))).toBe(true);
+
       clearAllCredentials("removing");
+
+      // No DEK was ever created for a pure removal, and no legacy items remain.
       expect(readRecoveryStore(storePath)).toEqual({});
+      expect(existsSync(getAuthEntryEncFilePath("removing"))).toBe(false);
     });
+  });
+
+  it("serializes first-time encryption-key creation across processes", { timeout: 90_000 }, async () => {
+    // Regression: two fresh processes that both observe "no key" must not each
+    // write their own DEK and orphan one side's encrypted files. The fake
+    // keyring below choreographs the exact losing interleaving: both processes
+    // observe an absent key, then the first writes and reads back its own key
+    // before the second's write lands.
+    const harnessDir = mkdtempSync(join(tmpdir(), "pi-mcp-dek-race-"));
+    const keyctlPath = join(harnessDir, "keyctl");
+    const helperPath = join(harnessDir, "helper.cjs");
+    const childPath = join(harnessDir, "child.mts");
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+    writeFileSync(keyctlPath, `#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" != "session" ] || [ "$2" != "-" ]; then exit 64; fi
+shift 2
+exec "$@"
+`, { mode: 0o755 });
+    writeFileSync(helperPath, String.raw`
+const { closeSync, existsSync, openSync, readFileSync, readdirSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const root = process.env.RACE_ROOT;
+const req = JSON.parse(readFileSync(0, 'utf8'));
+const storePath = join(root, 'store.json');
+const leaderPath = join(root, 'leader');
+const out = value => process.stdout.write(JSON.stringify(value) + '\n');
+const readStore = () => existsSync(storePath) ? JSON.parse(readFileSync(storePath, 'utf8')) : {};
+if (req.operation === 'read' && req.account === 'encryption-key.v1' && !existsSync(leaderPath)) {
+  writeFileSync(join(root, 'initial-' + process.ppid), '');
+  while (readdirSync(root).filter(name => name.startsWith('initial-')).length < 2) sleep(5);
+  out({ ok: true, found: false });
+} else if (req.operation === 'write' && req.account === 'encryption-key.v1') {
+  let leader = false;
+  try { closeSync(openSync(leaderPath, 'wx')); leader = true; } catch {}
+  if (!leader) while (!existsSync(join(root, 'leader-read-done'))) sleep(5);
+  writeFileSync(storePath, JSON.stringify({ [req.account]: req.payload }));
+  out({ ok: true });
+} else if (req.operation === 'read') {
+  const store = readStore();
+  const value = store[req.account];
+  if (req.account === 'encryption-key.v1' && existsSync(leaderPath) && !existsSync(join(root, 'leader-read-done'))) {
+    writeFileSync(join(root, 'leader-read-done'), '');
+  }
+  out(value === undefined ? { ok: true, found: false } : { ok: true, found: true, value });
+} else {
+  out({ ok: true });
+}
+`);
+    // Deliberately DIFFERENT oauth dirs per process: the DEK is global, so the
+    // lock must be global too — per-dir locks let this exact race through.
+    writeFileSync(childPath, `
+process.env.MCP_OAUTH_DIR = ${JSON.stringify(authDir)} + '/' + process.argv[2];
+const auth = await import(${JSON.stringify(join(repoRoot, "mcp-auth.ts"))});
+const server = process.argv[2];
+if (process.argv[3] === 'save') {
+  auth.saveAuthEntry(server, { tokens: { accessToken: 'token-' + server } }, 'https://example.com');
+} else {
+  console.log(server, auth.getAuthEntry(server)?.tokens?.accessToken ?? 'UNREADABLE');
+}
+`);
+
+    // Divergent TMPDIRs: the DEK is global, so the lock must not be derived
+    // from the temp environment (terminal vs launchd processes diverge here).
+    const envFor = (server: string) => {
+      const childTmp = join(harnessDir, `tmp-${server}`);
+      mkdirSync(childTmp, { recursive: true });
+      return {
+        ...process.env,
+        TMPDIR: childTmp,
+        PI_MCP_ADAPTER_TEST_AUTH_STORE: "keyrevoked",
+        PI_MCP_ADAPTER_TEST_LINUX_KEYRING_RECOVERY: "1",
+        PI_MCP_ADAPTER_KEYRING_RECOVERY_KEYCTL: keyctlPath,
+        PI_MCP_ADAPTER_KEYRING_RECOVERY_NODE: process.execPath,
+        PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER: helperPath,
+        RACE_ROOT: harnessDir,
+      };
+    };
+    const run = (server: string, operation: string) => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", "tsx", childPath, server, operation], {
+        cwd: repoRoot,
+        env: envFor(server),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      child.on("close", code => code === 0 ? resolve(stdout.trim()) : reject(new Error(`${server} exited ${code}: ${stderr}`)));
+    });
+
+    try {
+      await Promise.all([run("alpha", "save"), run("beta", "save")]);
+      const results = await Promise.all([run("alpha", "read"), run("beta", "read")]);
+      expect(results.sort()).toEqual(["alpha token-alpha", "beta token-beta"]);
+      // Exactly one DEK exists despite the competing first-writers.
+      expect(Object.keys(readRecoveryStore(join(harnessDir, "store.json")))).toEqual([DEK_ACCOUNT]);
+    } finally {
+      rmSync(harnessDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never steals the encryption-key lock from a live holder", { timeout: 60_000 }, async () => {
+    // A live holder is never broken into, no matter how slow: staleness is
+    // age-based (60s) and reclamation quarantine-verifies identity.
+    const recoveryHarness = createRecoveryHarness();
+    const harnessDir = mkdtempSync(join(tmpdir(), "pi-mcp-dek-hold-"));
+    const holderPath = join(harnessDir, "holder.mjs");
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+    writeFileSync(holderPath, `
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
+import { join } from "node:path";
+const parent = join(userInfo().homedir, ".pi", "agent");
+const lockPath = join(parent, "mcp-oauth-dek.lock");
+const token = \`\${Date.now()}.\${process.pid}.holdertoken\`;
+const staging = mkdtempSync(join(parent, ".dek-lock-"));
+writeFileSync(join(staging, "owner"), token);
+renameSync(staging, lockPath);
+console.log("holding");
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);
+let survived = false;
+try { survived = readFileSync(join(lockPath, "owner"), "utf8") === token; } catch {}
+console.log(survived ? "survived" : "stolen");
+rmSync(lockPath, { recursive: true, force: true });
+`);
+
+    const holder = spawn(process.execPath, [holderPath], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+    let holderOut = "";
+    holder.stdout.on("data", chunk => { holderOut += chunk; });
+    holder.stderr.on("data", chunk => { holderOut += chunk; });
+    await new Promise<void>(resolve => {
+      const poll = () => (holderOut.includes("holding") ? resolve() : setTimeout(poll, 25));
+      poll();
+    });
+
+    try {
+      const startedAt = Date.now();
+      saveAuthEntry("waited", { tokens: { accessToken: "token" } });
+      const waitedMs = Date.now() - startedAt;
+      expect(getAuthEntry("waited")?.tokens?.accessToken).toBe("token");
+      await new Promise<void>(resolve => holder.on("close", () => resolve()));
+      expect(holderOut).toContain("survived");
+      expect(waitedMs).toBeGreaterThan(2000); // waited out the live holder, did not break in
+    } finally {
+      holder.kill();
+      rmSync(harnessDir, { recursive: true, force: true });
+      rmSync(recoveryHarness.harnessDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers the encryption-key lock from an immediately killed holder", { timeout: 60_000 }, async () => {
+    const recoveryHarness = createRecoveryHarness();
+    const harnessDir = mkdtempSync(join(tmpdir(), "pi-mcp-dek-killed-"));
+    const holderPath = join(harnessDir, "holder.mjs");
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+    writeFileSync(holderPath, `
+import { mkdtempSync, renameSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
+import { join } from "node:path";
+const parent = join(userInfo().homedir, ".pi", "agent");
+const staging = mkdtempSync(join(parent, ".dek-lock-"));
+writeFileSync(join(staging, "owner"), \`\${Date.now()}.\${process.pid}.killedholder\`);
+renameSync(staging, join(parent, "mcp-oauth-dek.lock"));
+console.log("holding");
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120000);
+`);
+
+    const holder = spawn(process.execPath, [holderPath], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+    let holderOut = "";
+    holder.stdout.on("data", chunk => { holderOut += chunk; });
+    holder.stderr.on("data", chunk => { holderOut += chunk; });
+    await new Promise<void>(resolve => {
+      const poll = () => (holderOut.includes("holding") ? resolve() : setTimeout(poll, 25));
+      poll();
+    });
+    holder.kill("SIGKILL"); // dies holding the lock; owner pid becomes ESRCH
+    await new Promise<void>(resolve => holder.on("close", () => resolve())); // reap the zombie
+
+    try {
+      const startedAt = Date.now();
+      saveAuthEntry("after-kill", { tokens: { accessToken: "token" } });
+      expect(getAuthEntry("after-kill")?.tokens?.accessToken).toBe("token");
+      // Dead-holder reclamation uses the 5s threshold, never the live 60s one.
+      expect(Date.now() - startedAt).toBeLessThan(30_000);
+    } finally {
+      rmSync(harnessDir, { recursive: true, force: true });
+      rmSync(recoveryHarness.harnessDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers from an ownerless stale lock without spinning forever", { timeout: 60_000 }, () => {
+    createRecoveryHarness();
+    const parent = join(userInfo().homedir, ".pi", "agent");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const lockPath = join(parent, "mcp-oauth-dek.lock");
+    rmSync(lockPath, { recursive: true, force: true });
+    mkdirSync(lockPath); // foreign/ownerless lock dir, e.g. from a crashed older build
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath, old, old);
+    try {
+      saveAuthEntry("after-ownerless", { tokens: { accessToken: "token" } });
+      expect(getAuthEntry("after-ownerless")?.tokens?.accessToken).toBe("token");
+    } finally {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+
+  it("settles concurrent stale-lock reclamation on a single acquisition", { timeout: 90_000 }, async () => {
+    // Two waiters, one stale lock: exactly one quarantine-rename wins; the
+    // loser must not delete or bypass the replacement holder.
+    const { storePath, logPath, harnessDir } = createRecoveryHarness();
+    const parent = join(userInfo().homedir, ".pi", "agent");
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const lockPath = join(parent, "mcp-oauth-dek.lock");
+    rmSync(lockPath, { recursive: true, force: true });
+    const staging = mkdtempSync(join(parent, ".dek-lock-"));
+    writeFileSync(join(staging, "owner"), `${Date.now() - 120_000}.4242424242.staletoken`);
+    renameSync(staging, lockPath);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lockPath, old, old);
+
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const childPath = join(harnessDir, "child.mts");
+    writeFileSync(childPath, `
+process.env.MCP_OAUTH_DIR = ${JSON.stringify(authDir)};
+const auth = await import(${JSON.stringify(join(repoRoot, "mcp-auth.ts"))});
+const server = process.argv[2];
+auth.saveAuthEntry(server, { tokens: { accessToken: 'token-' + server } }, 'https://example.com');
+console.log(server, auth.getAuthEntry(server)?.tokens?.accessToken ?? 'UNREADABLE');
+`);
+    const run = (server: string) => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", "tsx", childPath, server], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          PI_MCP_ADAPTER_FAKE_KEYRING_STORE: storePath,
+          PI_MCP_ADAPTER_FAKE_KEYRING_LOG: logPath,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      child.on("close", code => code === 0 ? resolve(stdout.trim()) : reject(new Error(`${server} exited ${code}: ${stderr}`)));
+    });
+
+    try {
+      const results = await Promise.all([run("reclaim-a"), run("reclaim-b")]);
+      expect(results.sort()).toEqual(["reclaim-a token-reclaim-a", "reclaim-b token-reclaim-b"]);
+      // Single DEK despite the reclaim race; the test process shares the store.
+      expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+      expect(getAuthEntry("reclaim-a")?.tokens?.accessToken).toBe("token-reclaim-a");
+      expect(getAuthEntry("reclaim-b")?.tokens?.accessToken).toBe("token-reclaim-b");
+    } finally {
+      rmSync(lockPath, { recursive: true, force: true });
+      rmSync(harnessDir, { recursive: true, force: true });
+    }
   });
 
   it("does not use the recovery helper for generic secure-store failures", () => {
