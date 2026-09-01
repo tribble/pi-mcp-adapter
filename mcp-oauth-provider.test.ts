@@ -21,7 +21,7 @@ import {
   setOAuthCallbackPort,
   type McpOAuthConfig,
 } from "./mcp-oauth-provider.ts"
-import { getAuthForUrl, saveAuthEntry } from "./mcp-auth.ts"
+import { getAuthForUrl, saveAuthEntry, updateTokens } from "./mcp-auth.ts"
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
 import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
 
@@ -557,6 +557,81 @@ describe("McpOAuthProvider", () => {
       const tokens = await provider.tokens()
       assert.strictEqual(tokens?.access_token, "token")
       assert.strictEqual(await provider.clientInformation(), undefined)
+    })
+
+    it("should not delete tokens rotated by a concurrent process", async () => {
+      const provider = createProvider()
+
+      await provider.saveTokens({
+        access_token: "stale-access",
+        token_type: "Bearer",
+        refresh_token: "stale-refresh",
+      })
+
+      // Simulate a concurrent pi process rotating the tokens on disk.
+      updateTokens(serverName, {
+        accessToken: "rotated-access",
+        refreshToken: "rotated-refresh",
+      }, serverUrl)
+
+      await provider.invalidateCredentials("tokens")
+
+      const tokens = await provider.tokens()
+      assert.strictEqual(tokens?.access_token, "rotated-access")
+      assert.strictEqual(tokens?.refresh_token, "rotated-refresh")
+    })
+
+    it("should not delete tokens rotated between tokens() read and invalidation", async () => {
+      const writer = createProvider()
+      await writer.saveTokens({
+        access_token: "read-access",
+        token_type: "Bearer",
+        refresh_token: "read-refresh",
+      })
+
+      const reader = createProvider()
+      const read = await reader.tokens()
+      assert.strictEqual(read?.access_token, "read-access")
+
+      // Rotation lands after the read but before the invalidation.
+      updateTokens(serverName, {
+        accessToken: "rotated-access",
+        refreshToken: "rotated-refresh",
+      }, serverUrl)
+
+      await reader.invalidateCredentials("tokens")
+
+      const tokens = await reader.tokens()
+      assert.strictEqual(tokens?.access_token, "rotated-access")
+    })
+
+    it("should not delete tokens when this provider never served any", async () => {
+      // Another process's valid tokens are on disk; the SDK can invalidate
+      // (e.g. InvalidGrantError from a code exchange) before tokens() ran.
+      updateTokens(serverName, {
+        accessToken: "other-access",
+        refreshToken: "other-refresh",
+      }, serverUrl)
+
+      const provider = createProvider()
+      await provider.invalidateCredentials("tokens")
+
+      const entry = getAuthForUrl(serverName, serverUrl)
+      assert.strictEqual(entry?.tokens?.accessToken, "other-access")
+    })
+
+    it("should delete tokens when no concurrent rotation happened", async () => {
+      const provider = createProvider()
+
+      await provider.saveTokens({
+        access_token: "only-access",
+        token_type: "Bearer",
+        refresh_token: "only-refresh",
+      })
+
+      await provider.invalidateCredentials("tokens")
+
+      assert.strictEqual(await provider.tokens(), undefined)
     })
   })
 })

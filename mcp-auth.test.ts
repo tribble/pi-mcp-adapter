@@ -28,6 +28,10 @@ import {
   clearAllCredentials,
   clearClientInfo,
   clearTokens,
+  clearTokensIfUnchanged,
+  updateTokensIfUnchanged,
+  __clearStoredDataEncryptionKeyForTests,
+  __resetAuthEncryptionKeyCacheForTests,
   type AuthEntry,
 } from "./mcp-auth.ts"
 
@@ -414,6 +418,83 @@ describe("mcp-auth", () => {
       const entry = getAuthEntry("test-server")
       assert.strictEqual(entry?.tokens, undefined)
       assert.strictEqual(entry?.clientInfo?.clientId, "client")
+    })
+  })
+
+  describe("clearTokensIfUnchanged", () => {
+    it("should delete tokens when they match the expected pair", () => {
+      updateTokens("guarded-server", { accessToken: "a", refreshToken: "r" })
+
+      clearTokensIfUnchanged("guarded-server", { accessToken: "a", refreshToken: "r" })
+
+      assert.strictEqual(getAuthEntry("guarded-server")?.tokens, undefined)
+    })
+
+    it("should keep tokens rotated by another process", () => {
+      updateTokens("guarded-server", { accessToken: "rotated", refreshToken: "rotated-r" })
+
+      clearTokensIfUnchanged("guarded-server", { accessToken: "a", refreshToken: "r" })
+
+      assert.strictEqual(getAuthEntry("guarded-server")?.tokens?.accessToken, "rotated")
+    })
+  })
+
+  describe("updateTokensIfUnchanged", () => {
+    it("should write when the stored tokens match the expected pair", () => {
+      updateTokens("stamp-server", { accessToken: "a", refreshToken: "r" })
+
+      updateTokensIfUnchanged("stamp-server", { accessToken: "a", refreshToken: "r" }, { accessToken: "a", refreshToken: "r", issuer: "https://issuer.example.com" })
+
+      assert.strictEqual(getAuthEntry("stamp-server")?.tokens?.issuer, "https://issuer.example.com")
+    })
+
+    it("should skip the write when tokens were rotated by another process", () => {
+      updateTokens("stamp-server", { accessToken: "rotated", refreshToken: "rotated-r" })
+
+      updateTokensIfUnchanged("stamp-server", { accessToken: "a", refreshToken: "r" }, { accessToken: "a", refreshToken: "r", issuer: "https://issuer.example.com" })
+
+      const tokens = getAuthEntry("stamp-server")?.tokens
+      assert.strictEqual(tokens?.accessToken, "rotated")
+      assert.strictEqual(tokens?.issuer, undefined)
+    })
+  })
+
+  describe("credential mutation lock", () => {
+    it("migrates a legacy plaintext entry inside a locked mutation without deadlocking", () => {
+      // Genuine nested acquisition: clearTokens holds the lock, its read hits
+      // the legacy plaintext file, and the migration write (plus first-time
+      // DEK creation with a cold cache) re-enters the same lock.
+      __resetAuthEncryptionKeyCacheForTests()
+      __clearStoredDataEncryptionKeyForTests()
+      const legacyPath = getAuthEntryFilePath("legacy-nested")
+      mkdirSync(dirname(legacyPath), { recursive: true })
+      writeFileSync(legacyPath, JSON.stringify({
+        tokens: { accessToken: "legacy-token" },
+        clientInfo: { clientId: "legacy-client" },
+        serverUrl: "https://example.com/mcp",
+      }))
+
+      const start = Date.now()
+      clearTokens("legacy-nested")
+
+      assert.ok(Date.now() - start < 5000, "locked mutation with legacy migration took too long (nested lock deadlock?)")
+      const entry = getAuthEntry("legacy-nested")
+      assert.strictEqual(entry?.tokens, undefined)
+      assert.strictEqual(entry?.clientInfo?.clientId, "legacy-client")
+      assert.strictEqual(existsSync(legacyPath), false)
+    })
+
+    it("creates the DEK inside a locked mutation without deadlocking", () => {
+      // Cold DEK cache and store: the locked updateTokens body triggers DEK
+      // creation, which acquires the same lock (reentrant, must not spin).
+      __resetAuthEncryptionKeyCacheForTests()
+      __clearStoredDataEncryptionKeyForTests()
+
+      const start = Date.now()
+      updateTokens("nested-dek-lock", { accessToken: "a" }, "https://example.com/mcp")
+
+      assert.ok(Date.now() - start < 5000, "locked mutation with cold DEK took too long (nested lock deadlock?)")
+      assert.strictEqual(getAuthEntry("nested-dek-lock")?.tokens?.accessToken, "a")
     })
   })
 })

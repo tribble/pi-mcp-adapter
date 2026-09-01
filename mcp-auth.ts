@@ -469,6 +469,15 @@ export function __resetAuthEncryptionKeyCacheForTests(): void {
   pendingLegacyKeyringRetirement.clear();
 }
 
+/** Test-only hook: remove the stored DEK so the next locked write recreates it. */
+export function __clearStoredDataEncryptionKeyForTests(): void {
+  // Deleting the production DEK would orphan every encrypted entry.
+  if (!process.env[TEST_AUTH_STORE_ENV]) {
+    throw new Error(`__clearStoredDataEncryptionKeyForTests requires ${TEST_AUTH_STORE_ENV} to be set`);
+  }
+  getAuthSecretStore().remove(AUTH_DEK_ACCOUNT);
+}
+
 function getAuthStoreKind(): string {
   return process.env[TEST_AUTH_STORE_ENV] ?? 'keyring';
 }
@@ -674,37 +683,104 @@ function releaseDataEncryptionKeyLock(handle: DekLockHandle): void {
   }
 }
 
-function withDataEncryptionKeyLock<T>(fn: (refresh: () => void) => T): T {
+/** Thrown when the on-disk lock was reclaimed while a section stalled. Exported so status-only callers can treat it as a transient unavailable, not as absent credentials. */
+export class DekLockLostError extends Error {
+  constructor() {
+    super('OAuth credential lock was reclaimed while held (section stalled past the lease); aborting instead of writing without exclusion');
+  }
+}
+
+interface DekLockLease {
+  /** Token-verified heartbeat: re-stamps the owner file only while it is still ours. */
+  refresh(): void;
+  /** Throws DekLockLostError when the lock was reclaimed out from under us. */
+  assertOwned(): void;
+}
+
+// Reentrant within the process: locked credential mutations resolve the DEK
+// (getOrCreateDataEncryptionKeyInStore) inside their critical section, and a
+// nested acquire of the on-disk lock would spin forever.
+let activeDekLockLease: DekLockLease | undefined;
+
+// Tripwire, not cancellation: the reentrancy guard is only correct for
+// synchronous sections, so a thenable return means the continuation is
+// already running unlocked. Throwing here surfaces the bug loudly; it cannot
+// stop the escaped continuation.
+function assertSyncLockSection<T>(result: T): T {
+  if (typeof (result as { then?: unknown } | null | undefined)?.then === 'function') {
+    throw new Error('withDataEncryptionKeyLock requires a synchronous callback');
+  }
+  return result;
+}
+
+type NotThenable<T> = T extends PromiseLike<unknown> ? never : T;
+
+function withDataEncryptionKeyLock<T>(fn: (lease: DekLockLease) => NotThenable<T>): T {
+  if (activeDekLockLease) return assertSyncLockSection(fn(activeDekLockLease));
   const parent = getDataEncryptionKeyLockParent();
   const handle = acquireDataEncryptionKeyLock(parent);
-  try {
-    return fn(() => {
-      // Heartbeat for slow keyring calls: a live holder refreshing never looks
-      // stale, and a reclaimer that captured a pre-refresh token restores us.
+  let lost = false;
+  const owned = (): boolean => {
+    if (!lost) lost = readDekLockOwner(handle.lockPath)?.endsWith(`.${handle.tokenId}`) !== true;
+    return !lost;
+  };
+  const lease: DekLockLease = {
+    refresh() {
+      // Heartbeat for slow keyring calls, token-verified so a reclaimed and
+      // re-acquired lock is never stamped over. On mismatch the handle is
+      // marked lost and release no-ops (mirrors releaseDataEncryptionKeyLock).
+      if (!owned()) return;
       try {
         writeFileSync(join(handle.lockPath, 'owner'), dekLockOwnerContent(handle.tokenId));
       } catch {
-        // Lock was reclaimed out from under us; the section still completes.
+        // Lock dir vanished under us (reclaim in progress).
+        lost = true;
       }
-    });
+    },
+    assertOwned() {
+      if (!owned()) throw new DekLockLostError();
+    },
+  };
+  activeDekLockLease = lease;
+  try {
+    return assertSyncLockSection(fn(lease));
   } finally {
-    releaseDataEncryptionKeyLock(handle);
+    activeDekLockLease = undefined;
+    if (!lost) releaseDataEncryptionKeyLock(handle);
   }
+}
+
+/** Keep an active mutation lease alive during long legacy chunk traversals. */
+function heartbeatActiveDekLockLease(): void {
+  activeDekLockLease?.refresh();
+}
+
+/** Test-only hook: run a section under the credential lock (reentrant). */
+export function __withDataEncryptionKeyLockForTests<T>(fn: (lease: DekLockLease) => NotThenable<T>): T {
+  if (!process.env[TEST_AUTH_STORE_ENV]) {
+    throw new Error(`__withDataEncryptionKeyLockForTests requires ${TEST_AUTH_STORE_ENV} to be set`);
+  }
+  return withDataEncryptionKeyLock(fn);
 }
 
 function getOrCreateDataEncryptionKeyInStore(store: AuthSecretStore): Buffer {
   const existing = readDataEncryptionKeyFromStore(store);
   if (existing) return existing;
-  return withDataEncryptionKeyLock(refresh => {
+  return withDataEncryptionKeyLock(lease => {
     // Another process may have created the key while we waited for the lock.
     const recheck = readDataEncryptionKeyFromStore(store);
     if (recheck) return recheck;
     const generated = randomBytes(32);
-    refresh();
+    lease.assertOwned(); // The keyring read may have stalled past the lease.
+    lease.refresh();
     store.write(AUTH_DEK_ACCOUNT, generated.toString('base64'));
-    refresh();
+    lease.refresh();
     // Read back so the common concurrent-first-write case settles on the stored key.
-    return readDataEncryptionKeyFromStore(store) ?? generated;
+    const stored = readDataEncryptionKeyFromStore(store) ?? generated;
+    // The write/read-back may have stalled past the lease; returning a key
+    // written without exclusion could diverge from another creator's key.
+    lease.assertOwned();
+    return stored;
   });
 }
 
@@ -918,6 +994,7 @@ function readLegacyKeyringAuthEntry(store: AuthSecretStore, serverName: string):
 
   const chunks: string[] = [];
   for (const chunkAccount of getAuthEntryChunkAccounts(account, parsed)) {
+    heartbeatActiveDekLockLease(); // Long chunked traversals can outlive the lock lease.
     const chunk = readAccount(chunkAccount);
     if (chunk === undefined) {
       retire();
@@ -962,6 +1039,7 @@ function removeLegacyKeyringAuthEntry(store: AuthSecretStore, serverName: string
     const parsed = JSON.parse(payload) as unknown;
     if (isAuthEntryChunkManifest(parsed)) {
       for (const chunkAccount of getAuthEntryChunkAccounts(account, parsed)) {
+        heartbeatActiveDekLockLease(); // Long chunked traversals can outlive the lock lease.
         try {
           store.remove(chunkAccount);
         } catch {
@@ -1043,24 +1121,55 @@ function readAuthEntryFromStore(
     return encrypted;
   }
 
-  const legacyKeyringEntry = readLegacyKeyringAuthEntry(store, serverName);
-  if (legacyKeyringEntry) {
-    writeEncryptedAuthEntry(serverName, legacyKeyringEntry, options);
-    try {
-      removeLegacyKeyringAuthEntry(store, serverName);
-    } catch {
-      // The encrypted file is canonical now; leftover legacy items are never
-      // read again, so cleanup failure must not fail authentication.
-    }
-    tryRemoveLegacyAuthEntry(serverName, options);
-    return legacyKeyringEntry;
+  // Existence probes only: the authoritative legacy read happens inside the
+  // migration lock. A concurrently running pre-v5 process can rotate the
+  // keyring entry between probe and migration; reading under the lock makes
+  // the fresher value win instead of persisting (and then deleting) a stale
+  // snapshot.
+  if (readLegacyKeyringAuthEntry(store, serverName) !== undefined) {
+    return migrateLegacyEntry(store, serverName, options);
   }
 
-  const legacyEntry = readLegacyAuthEntry(serverName, options);
-  if (!legacyEntry) return undefined;
-  writeEncryptedAuthEntry(serverName, legacyEntry, options);
-  tryRemoveLegacyAuthEntry(serverName, options);
-  return legacyEntry;
+  if (!existsSync(getAuthEntryFilePath(serverName, options))) return undefined;
+  return migrateLegacyEntry(undefined, serverName, options);
+}
+
+/**
+ * Persist a legacy entry as the canonical encrypted file. Only migration
+ * holds the lock; plain reads stay unlocked. Inside the lock the canonical
+ * file is re-checked and the legacy source is re-read: another process may
+ * have migrated (and since rotated) — or a pre-v5 process may have written
+ * fresher legacy credentials — while we waited, and overwriting either with
+ * a stale snapshot would lose tokens. When both exist, the canonical file
+ * wins and the legacy remnants are retired (the legacy writer cannot see
+ * the encrypted file; keeping its entries would re-prompt on every read).
+ */
+function migrateLegacyEntry(
+  keyringStore: AuthSecretStore | undefined,
+  serverName: string,
+  options?: AuthStorageOptions,
+): AuthEntry | undefined {
+  return withDataEncryptionKeyLock(lease => {
+    lease.refresh();
+    const current = readEncryptedAuthEntry(serverName, options);
+    const legacy = keyringStore
+      ? readLegacyKeyringAuthEntry(keyringStore, serverName)
+      : readLegacyAuthEntry(serverName, options);
+    lease.assertOwned(); // The legacy keyring read may have stalled past the lease.
+    if (!current && legacy) writeEncryptedAuthEntry(serverName, legacy, options);
+    if (keyringStore) {
+      lease.refresh(); // Heartbeat: keyring removal can stall on an OS prompt.
+      try {
+        removeLegacyKeyringAuthEntry(keyringStore, serverName);
+      } catch {
+        // The encrypted file is canonical now; leftover legacy items are never
+        // read again, so cleanup failure must not fail authentication.
+      }
+      lease.assertOwned(); // Do not finish the section if the lock was reclaimed.
+    }
+    tryRemoveLegacyAuthEntry(serverName, options);
+    return current ?? legacy;
+  });
 }
 
 function readAuthEntry(
@@ -1116,6 +1225,9 @@ export function inspectAuthForUrl(
     if (!entry?.serverUrl || entry.serverUrl !== serverUrl) return { status: 'absent' };
     return { status: 'present', entry };
   } catch (error) {
+    // A lock lost mid-migration is transient contention, not missing
+    // credentials: report unavailable rather than throwing through status UI.
+    if (error instanceof DekLockLostError) return { status: 'unavailable', message: error.message };
     if (!(error instanceof OAuthCredentialStoreError)) throw error;
     return { status: 'unavailable', message: formatOAuthCredentialStoreUnavailable(error) };
   }
@@ -1125,12 +1237,23 @@ export function inspectAuthForUrl(
  * Save auth entry for a server.
  */
 export function saveAuthEntry(serverName: string, entry: AuthEntry, serverUrl?: string, options?: AuthStorageOptions): void {
-  // Always update serverUrl if provided
-  if (serverUrl) {
-    entry.serverUrl = serverUrl;
-  }
-  writeEncryptedAuthEntry(serverName, entry, options);
-  removeLegacyAuthEntry(serverName, options);
+  // Resolve the DEK before taking the credential lock: first-time DEK
+  // creation acquires the same lock, and its concurrent-first-write handling
+  // (both processes observe "no key" before one wins) must stay outside this
+  // critical section.
+  getDataEncryptionKey(true);
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh();
+    // Always update serverUrl if provided
+    if (serverUrl) {
+      entry.serverUrl = serverUrl;
+    }
+    // Nested sections reach this write after slow keyring reads in the outer
+    // section; never persist without verified ownership of the lock.
+    lease.assertOwned();
+    writeEncryptedAuthEntry(serverName, entry, options);
+    removeLegacyAuthEntry(serverName, options);
+  });
 }
 
 /**
@@ -1138,16 +1261,24 @@ export function saveAuthEntry(serverName: string, entry: AuthEntry, serverUrl?: 
  * items, and any legacy plaintext file.
  */
 export function removeAuthEntry(serverName: string, options?: AuthStorageOptions): void {
-  // The encrypted file is the canonical credential and needs no keyring access:
-  // remove it first so logout still works when the OS credential store is down.
-  removeEncryptedAuthEntry(serverName, options);
-  try {
-    removeLegacyKeyringAuthEntry(getAuthSecretStore(), serverName);
-  } catch (error) {
-    if (!shouldAttemptLinuxKeyringRecovery(error)) throw error;
-    removeLegacyKeyringAuthEntry(linuxKeyringRecoveryAuthSecretStore, serverName);
-  }
-  removeLegacyAuthEntry(serverName, options);
+  // Locked so a concurrent updater cannot resurrect the entry it read before
+  // this logout deleted it.
+  withDataEncryptionKeyLock(lease => {
+    // The encrypted file is the canonical credential and needs no keyring access:
+    // remove it first so logout still works when the OS credential store is down.
+    removeEncryptedAuthEntry(serverName, options);
+    lease.refresh(); // Heartbeat: keyring removal can stall on an OS prompt.
+    try {
+      removeLegacyKeyringAuthEntry(getAuthSecretStore(), serverName);
+    } catch (error) {
+      if (!shouldAttemptLinuxKeyringRecovery(error)) throw error;
+      removeLegacyKeyringAuthEntry(linuxKeyringRecoveryAuthSecretStore, serverName);
+    }
+    // The keyring removal may have stalled past the lease; deleting the
+    // plaintext remnant without the lock could race a fresh writer.
+    lease.assertOwned();
+    removeLegacyAuthEntry(serverName, options);
+  });
 }
 
 /**
@@ -1159,14 +1290,43 @@ export function updateTokens(
   serverUrl?: string,
   options?: AuthStorageOptions
 ): void {
-  const entry = getAuthEntry(serverName, options) ?? {};
-  if (serverUrl && entry.serverUrl !== serverUrl) {
-    delete entry.clientInfo;
-    delete entry.codeVerifier;
-    delete entry.oauthState;
-  }
-  entry.tokens = tokens;
-  saveAuthEntry(serverName, entry, serverUrl, options);
+  getDataEncryptionKey(true); // hoisted: see saveAuthEntry
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options) ?? {};
+    if (serverUrl && entry.serverUrl !== serverUrl) {
+      delete entry.clientInfo;
+      delete entry.codeVerifier;
+      delete entry.oauthState;
+    }
+    entry.tokens = tokens;
+    saveAuthEntry(serverName, entry, serverUrl, options);
+  });
+}
+
+function storedTokensMatch(first: StoredTokens, second: StoredTokens): boolean {
+  return first.accessToken === second.accessToken
+    && first.refreshToken === second.refreshToken;
+}
+
+/**
+ * Update tokens only while the stored tokens still match the expected ones.
+ * Same concurrent-rotation guard as clearTokensIfUnchanged: never overwrite
+ * tokens another process rotated after our read.
+ */
+export function updateTokensIfUnchanged(
+  serverName: string,
+  expected: StoredTokens,
+  tokens: StoredTokens,
+  options?: AuthStorageOptions
+): void {
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (!entry?.tokens || !storedTokensMatch(entry.tokens, expected)) return;
+    entry.tokens = tokens;
+    saveAuthEntry(serverName, entry, undefined, options);
+  });
 }
 
 /**
@@ -1178,25 +1338,32 @@ export function updateClientInfo(
   serverUrl?: string,
   options?: AuthStorageOptions
 ): void {
-  const entry = getAuthEntry(serverName, options) ?? {};
-  if (serverUrl && entry.serverUrl !== serverUrl) {
-    delete entry.tokens;
-    delete entry.codeVerifier;
-    delete entry.oauthState;
-  }
-  entry.clientInfo = clientInfo;
-  saveAuthEntry(serverName, entry, serverUrl, options);
+  getDataEncryptionKey(true); // hoisted: see saveAuthEntry
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options) ?? {};
+    if (serverUrl && entry.serverUrl !== serverUrl) {
+      delete entry.tokens;
+      delete entry.codeVerifier;
+      delete entry.oauthState;
+    }
+    entry.clientInfo = clientInfo;
+    saveAuthEntry(serverName, entry, serverUrl, options);
+  });
 }
 
 /**
  * Clear code verifier for a server.
  */
 export function clearCodeVerifier(serverName: string, options?: AuthStorageOptions): void {
-  const entry = getAuthEntry(serverName, options);
-  if (entry) {
-    delete entry.codeVerifier;
-    saveAuthEntry(serverName, entry, undefined, options);
-  }
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (entry) {
+      delete entry.codeVerifier;
+      saveAuthEntry(serverName, entry, undefined, options);
+    }
+  });
 }
 
 /**
@@ -1211,11 +1378,14 @@ export function getOAuthState(serverName: string, options?: AuthStorageOptions):
  * Clear OAuth state for a server.
  */
 export function clearOAuthState(serverName: string, options?: AuthStorageOptions): void {
-  const entry = getAuthEntry(serverName, options);
-  if (entry) {
-    delete entry.oauthState;
-    saveAuthEntry(serverName, entry, undefined, options);
-  }
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (entry) {
+      delete entry.oauthState;
+      saveAuthEntry(serverName, entry, undefined, options);
+    }
+  });
 }
 
 /**
@@ -1229,20 +1399,46 @@ export function clearAllCredentials(serverName: string, options?: AuthStorageOpt
  * Clear only client info for a server.
  */
 export function clearClientInfo(serverName: string, options?: AuthStorageOptions): void {
-  const entry = getAuthEntry(serverName, options);
-  if (entry) {
-    delete entry.clientInfo;
-    saveAuthEntry(serverName, entry, undefined, options);
-  }
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (entry) {
+      delete entry.clientInfo;
+      saveAuthEntry(serverName, entry, undefined, options);
+    }
+  });
 }
 
 /**
  * Clear only tokens for a server.
  */
 export function clearTokens(serverName: string, options?: AuthStorageOptions): void {
-  const entry = getAuthEntry(serverName, options);
-  if (entry) {
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (entry) {
+      delete entry.tokens;
+      saveAuthEntry(serverName, entry, undefined, options);
+    }
+  });
+}
+
+/**
+ * Clear tokens only if the stored tokens still match the expected ones.
+ * A concurrent pi process may have rotated the tokens on disk since this
+ * process last read them; deleting those newer tokens would destroy valid
+ * credentials and force a full re-auth.
+ */
+export function clearTokensIfUnchanged(
+  serverName: string,
+  expected: StoredTokens,
+  options?: AuthStorageOptions
+): void {
+  withDataEncryptionKeyLock(lease => {
+    lease.refresh(); // Heartbeat: the read below can stall on legacy keyring access.
+    const entry = getAuthEntry(serverName, options);
+    if (!entry?.tokens || !storedTokensMatch(entry.tokens, expected)) return;
     delete entry.tokens;
     saveAuthEntry(serverName, entry, undefined, options);
-  }
+  });
 }

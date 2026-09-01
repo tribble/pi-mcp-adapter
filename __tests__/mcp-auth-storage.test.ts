@@ -7,6 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   __resetAuthEncryptionKeyCacheForTests,
+  __withDataEncryptionKeyLockForTests,
   clearAllCredentials,
   formatOAuthCredentialStoreUnavailable,
   getAuthEntry,
@@ -17,6 +18,7 @@ import {
   inspectAuthForUrl,
   OAuthCredentialStoreError,
   saveAuthEntry,
+  updateTokens,
 } from "../mcp-auth.ts";
 
 const DEK_ACCOUNT = "encryption-key.v1";
@@ -514,6 +516,78 @@ describe("mcp-auth storage paths", () => {
       expect(getAuthEntry("small-legacy")?.tokens?.accessToken).toBe("small-token");
     });
 
+    it("migrates the fresher value when a pre-v5 process rotates the legacy entry mid-migration", () => {
+      // Mixed-version race: the v5 probe reads legacy token A, then a still-
+      // running pre-v5 process rotates and writes token B to the keyring.
+      // The migration must persist B (read authoritatively under the lock),
+      // never write stale A over it, and never delete B unmigrated.
+      const stale = { tokens: { accessToken: "stale-token" }, serverUrl: "https://example.com/mcp" };
+      const rotated = {
+        tokens: { accessToken: "rotated-token", refreshToken: "rotated-refresh" },
+        serverUrl: "https://example.com/mcp",
+      };
+      seedLegacyKeyringEntry(storePath, "mixed-version", stale);
+
+      // A helper that plays the pre-v5 process: the FIRST read of the legacy
+      // account (the probe) answers with the stale value and atomically
+      // rewrites the store to the rotated one, so the second (locked,
+      // authoritative) read observes the rotation.
+      const markerPath = join(harnessDir, "rotated");
+      const rotateHelperPath = join(harnessDir, "helper-rotate.cjs");
+      writeFileSync(rotateHelperPath, `const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs');
+const input = JSON.parse(readFileSync(0, 'utf8'));
+appendFileSync(process.env.PI_MCP_ADAPTER_FAKE_KEYRING_LOG, input.operation + ' ' + input.account + '\\n');
+const path = process.env.PI_MCP_ADAPTER_FAKE_KEYRING_STORE;
+const store = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+const persist = () => {
+  const tmp = path + '.' + process.pid + '.tmp';
+  writeFileSync(tmp, JSON.stringify(store));
+  require('node:fs').renameSync(tmp, path);
+};
+if (input.operation === 'read') {
+  const value = store[input.account];
+  const spec = process.env.PI_MCP_ADAPTER_FAKE_KEYRING_ROTATE;
+  if (spec) {
+    const rotate = JSON.parse(spec);
+    if (input.account === rotate.account && !existsSync(rotate.marker)) {
+      writeFileSync(rotate.marker, '');
+      store[rotate.account] = rotate.value;
+      persist();
+    }
+  }
+  process.stdout.write(JSON.stringify(value === undefined ? { ok: true, found: false } : { ok: true, found: true, value }) + '\\n');
+} else if (input.operation === 'write') {
+  store[input.account] = input.payload;
+  persist();
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+} else if (input.operation === 'remove') {
+  delete store[input.account];
+  persist();
+  process.stdout.write(JSON.stringify({ ok: true }) + '\\n');
+} else {
+  process.stdout.write(JSON.stringify({ ok: false, error: 'bad op' }) + '\\n');
+  process.exitCode = 1;
+}
+`);
+      process.env.PI_MCP_ADAPTER_KEYRING_RECOVERY_HELPER = rotateHelperPath;
+      process.env.PI_MCP_ADAPTER_FAKE_KEYRING_ROTATE = JSON.stringify({
+        account: accountFor("mixed-version"),
+        value: JSON.stringify(rotated),
+        marker: markerPath,
+      });
+      try {
+        expect(getAuthEntry("mixed-version")).toEqual(rotated);
+        // The rotation really did land between the probe and the locked read.
+        expect(existsSync(markerPath)).toBe(true);
+        // The rotated legacy entry was migrated, then retired: only the DEK remains.
+        expect(Object.keys(readRecoveryStore(storePath))).toEqual([DEK_ACCOUNT]);
+        // The canonical file persists the rotated tokens (second read is file-only).
+        expect(getAuthEntry("mixed-version")).toEqual(rotated);
+      } finally {
+        delete process.env.PI_MCP_ADAPTER_FAKE_KEYRING_ROTATE;
+      }
+    });
+
     it("migrates legacy keyring entries during status inspection, then never touches the keyring again", () => {
       seedLegacyKeyringEntry(storePath, "panel-server", { tokens: { accessToken: "panel-token" }, serverUrl: "https://example.com/mcp" });
 
@@ -884,6 +958,75 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120000);
       expect(getAuthEntry("after-ownerless")?.tokens?.accessToken).toBe("token");
     } finally {
       rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts a mutation without writing when the lock is reclaimed mid-section", { timeout: 60_000 }, () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    saveAuthEntry("victim", { tokens: { accessToken: "keep-me" } }, "https://example.com/mcp");
+    const before = readFileSync(getAuthEntryEncFilePath("victim"), "utf8");
+
+    const parent = join(userInfo().homedir, ".pi", "agent");
+    const lockPath = join(parent, "mcp-oauth-dek.lock");
+    const foreignOwner = `${Date.now()}.${process.pid}.foreigntoken`;
+    try {
+      expect(() => __withDataEncryptionKeyLockForTests(lease => {
+        // Simulate a reclaim: the on-disk lock now belongs to another process.
+        writeFileSync(join(lockPath, "owner"), foreignOwner);
+        // The token-verified heartbeat must not stamp over the foreign owner.
+        lease.refresh();
+        expect(readFileSync(join(lockPath, "owner"), "utf8")).toBe(foreignOwner);
+        // The mutation must throw instead of writing without exclusion.
+        updateTokens("victim", { accessToken: "stale-loser" });
+      })).toThrow(/reclaimed while held/);
+
+      // Nothing was written; the foreign lock was neither stamped nor released.
+      expect(readFileSync(getAuthEntryEncFilePath("victim"), "utf8")).toBe(before);
+      expect(readFileSync(join(lockPath, "owner"), "utf8")).toBe(foreignOwner);
+      expect(getAuthEntry("victim")?.tokens?.accessToken).toBe("keep-me");
+    } finally {
+      // Only remove our simulated foreign lock; a real process's lock stays.
+      try {
+        if (readFileSync(join(lockPath, "owner"), "utf8") === foreignOwner) {
+          rmSync(lockPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+
+  it("reports unavailable instead of throwing when inspection loses the lock mid-migration", { timeout: 60_000 }, () => {
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    const entry = { tokens: { accessToken: "legacy-token" }, serverUrl: "https://example.com/mcp" };
+    const legacyPath = getAuthEntryFilePath("inspect-race");
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify(entry));
+
+    const parent = join(userInfo().homedir, ".pi", "agent");
+    const lockPath = join(parent, "mcp-oauth-dek.lock");
+    const foreignOwner = `${Date.now()}.${process.pid}.foreigninspect`;
+    try {
+      __withDataEncryptionKeyLockForTests(lease => {
+        // Simulate a reclaim before the migration's ownership assertion.
+        writeFileSync(join(lockPath, "owner"), foreignOwner);
+        lease.refresh();
+        // Status-only inspection degrades to unavailable...
+        expect(inspectAuthForUrl("inspect-race", "https://example.com/mcp").status).toBe("unavailable");
+        // ...while the fail-closed read path still throws deliberately.
+        expect(() => getAuthEntry("inspect-race")).toThrow(/reclaimed while held/);
+      });
+      // The aborted migration did not write or delete anything.
+      expect(readFileSync(legacyPath, "utf8")).toBe(JSON.stringify(entry));
+      expect(existsSync(getAuthEntryEncFilePath("inspect-race"))).toBe(false);
+    } finally {
+      try {
+        if (readFileSync(join(lockPath, "owner"), "utf8") === foreignOwner) {
+          rmSync(lockPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Already gone.
+      }
     }
   });
 

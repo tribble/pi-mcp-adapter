@@ -23,7 +23,8 @@ import {
   clearAllCredentials,
   clearClientInfo,
   clearCodeVerifier,
-  clearTokens,
+  clearTokensIfUnchanged,
+  updateTokensIfUnchanged,
   type AuthEntry,
   type AuthStorageOptions,
   type StoredTokens,
@@ -128,6 +129,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private flowDiscoveryState: OAuthDiscoveryState | undefined
   private flowIssuerMismatch = false
   private flowState: string | undefined
+  private servedTokens: StoredTokens | undefined
 
   constructor(
     private serverName: string,
@@ -155,6 +157,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   deactivate(): void {
     this.active = false
+    this.servedTokens = undefined
   }
 
   private assertStoredIssuerBindings(entry: AuthEntry | undefined, issuer: string | undefined): void {
@@ -350,13 +353,20 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async tokens(): Promise<OAuthTokens | undefined> {
     // Use getAuthForUrl to validate tokens are for the current server URL.
     const entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
-    if (!entry?.tokens) return undefined
+    if (!entry?.tokens) {
+      this.servedTokens = undefined
+      return undefined
+    }
     const issuer = this.discoveredIssuer
     this.assertStoredIssuerBindings(entry, issuer)
     if (issuer && entry.tokens.issuer === undefined) {
-      entry.tokens.issuer = issuer
-      updateTokens(this.serverName, entry.tokens, this.serverUrl, this.storageOptions)
+      // Guarded write: a concurrent process may have rotated the tokens since
+      // the read above; never overwrite rotated tokens with this stale pair.
+      const stamped = { ...entry.tokens, issuer }
+      updateTokensIfUnchanged(this.serverName, entry.tokens, stamped, this.storageOptions)
+      entry.tokens = stamped
     }
+    this.servedTokens = entry.tokens
 
     return {
       access_token: entry.tokens.accessToken,
@@ -387,6 +397,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     }
     this.throwIfInactive()
     updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
+    this.servedTokens = storedTokens
     // Discovery must survive the browser redirect so the callback can verify
     // the authorization server that minted the code. Once token issuance
     // succeeds, clear it so a later 401 re-reads PRM and can observe an
@@ -493,6 +504,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.flowDiscoveryState = undefined
         this.flowIssuerMismatch = false
         this.flowState = undefined
+        this.servedTokens = undefined
         clearAllCredentials(this.serverName, this.storageOptions)
         break
       case "client":
@@ -500,7 +512,16 @@ export class McpOAuthProvider implements OAuthClientProvider {
         clearClientInfo(this.serverName, this.storageOptions)
         break
       case "tokens":
-        clearTokens(this.serverName, this.storageOptions)
+        // Only delete the tokens this instance actually served: a concurrent
+        // pi process may have rotated them on disk, and deleting the newer
+        // tokens would destroy valid credentials (auth() re-reads and heals).
+        // No snapshot means the stored tokens aren't ours to delete either —
+        // the SDK can invalidate before tokens() ever ran; a genuinely dead
+        // token gets deleted by whichever process served it.
+        if (this.servedTokens) {
+          clearTokensIfUnchanged(this.serverName, this.servedTokens, this.storageOptions)
+        }
+        this.servedTokens = undefined
         break
       case "verifier":
         clearCodeVerifier(this.serverName, this.storageOptions)
